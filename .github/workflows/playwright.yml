@@ -1,0 +1,153 @@
+name: Playwright Tests
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  schedule:
+    - cron: '0 0 * * *'  # Run daily at midnight UTC
+
+jobs:
+  test:
+    name: 'Playwright Tests - ${{ matrix.browser }} - ${{ matrix.os }}'
+    runs-on: ${{ matrix.os }}
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        browser: [chromium, firefox, webkit]
+        python-version: [3.9]
+        exclude:
+          # Exclude webkit on Windows due to potential stability issues
+          - os: windows-latest
+            browser: webkit
+    
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/pw-browsers
+      TEST_ENV: staging
+      HEADLESS: true
+      DEFAULT_BROWSER: ${{ matrix.browser }}
+      PYTHONUNBUFFERED: 1
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+      
+      - name: Cache Playwright browsers
+        uses: actions/cache@v3
+        with:
+          path: ${{ env.PLAYWRIGHT_BROWSERS_PATH }}
+          key: ${{ runner.os }}-playwright-${{ matrix.browser }}-${{ hashFiles('requirements.txt') }}
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Ensure browsers are installed
+        run: |
+          python -m playwright install ${{ matrix.browser }}
+      
+      - name: Run tests
+        run: |
+          pytest --browser=${{ matrix.browser }} -v --reruns=2 --alluredir=./allure-results
+      
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-results-${{ matrix.browser }}-${{ matrix.os }}
+          path: |
+            allure-results/
+            reports/
+            test-results/
+            playwright-report/
+            screenshots/
+            videos/
+
+  report:
+    name: 'Generate Test Report'
+    runs-on: ubuntu-latest
+    needs: test
+    if: always()
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+      
+      - name: Download all test results
+        uses: actions/download-artifact@v3
+        with:
+          path: artifacts
+      
+      - name: Install Allure
+        run: |
+          curl -o allure-2.22.0.tgz -OLs https://repo.maven.apache.org/maven2/io/qameta/allure/allure-commandline/2.22.0/allure-commandline-2.22.0.tgz
+          tar -zxvf allure-2.22.0.tgz -C /tmp
+          sudo ln -s /tmp/allure-2.22.0/bin/allure /usr/local/bin/allure
+      
+      - name: Generate Allure report
+        run: |
+          # Create aggregated directory for all artifacts
+          mkdir -p allure-results
+          
+          # Copy all allure-results from all artifacts
+          find artifacts -name "*.json" -path "*/allure-results/*" -exec cp {} allure-results/ \;
+          
+          # Generate the report
+          allure generate allure-results --clean -o allure-report
+      
+      - name: Publish Allure report
+        uses: actions/upload-artifact@v3
+        with:
+          name: allure-report
+          path: allure-report
+          
+  notify:
+    name: 'Notify on failure'
+    runs-on: ubuntu-latest
+    needs: [test, report]
+    if: failure()
+    
+    steps:
+      - name: Send Slack notification
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          fields: repo,message,commit,author,action,eventName,ref,workflow
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        if: env.SLACK_WEBHOOK_URL != ''
+      
+      - name: Send email notification
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.MAIL_SERVER }}
+          server_port: ${{ secrets.MAIL_PORT }}
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: GitHub Actions - Test Failure - ${{ github.repository }}
+          body: |
+            Test failure in ${{ github.repository }}
+            
+            Workflow: ${{ github.workflow }}
+            Run ID: ${{ github.run_id }}
+            Run URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            
+            Commit: ${{ github.sha }}
+            
+            Please check the logs for more information.
+          to: ${{ secrets.MAIL_RECIPIENT }}
+          from: GitHub Actions <${{ secrets.MAIL_SENDER }}>
+        if: env.MAIL_SERVER != '' 
